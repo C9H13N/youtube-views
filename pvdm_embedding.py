@@ -96,7 +96,7 @@ class TrainData:
             pickle.dump(self.words_dict, pfile, protocol=pickle.HIGHEST_PROTOCOL)
         with open(paragraphs_ids_filename, 'wb') as pfile:
             pickle.dump(self.entries_ids, pfile, protocol=pickle.HIGHEST_PROTOCOL)
-        print("Dicts saved")
+        #print("Dicts saved")
     def load_dicts(logdir):
         words_ids_filename = os.path.join(logdir, params.words_ids_filename)
         paragraphs_ids_filename = os.path.join(logdir, params.paragraphs_ids_filename)
@@ -145,7 +145,8 @@ class PVDM:
         if self.is_training:
             self.opt = tf.train.AdamOptimizer(params.learning_rate).minimize(self.loss,global_step=gs)
         else:
-            self.opt = tf.train.GradientDescentOptimizer(params.learning_rate).minimize(self.loss,global_step=gs)
+            self.opt = tf.train.AdamOptimizer(params.learning_rate).minimize(self.loss, global_step=gs)
+            # self.opt = tf.train.GradientDescentOptimizer(params.learning_rate).minimize(self.loss,global_step=gs)
         self.prediction_ids = tf.cast(tf.argmax(self.prediction, axis=-1), tf.int32)
         self.accuracy = tf.reduce_mean(tf.cast(tf.equal(self.prediction_ids, self.target_words), tf.float32))
         # self.opt = tf.train.GradientDescentOptimizer(params.learning_rate).minimize(self.loss,global_step=gs)
@@ -217,23 +218,28 @@ class Embedding:
             self.model = PVDM(False, logdir=self.feature_name, num_words=self.words_counts,
                               num_paragraphs=num_paragraphs, paragraphs_embeddings=paragraps_emb)
             self.model.create_model(self.words_counts)
-            self.saver = tf.train.Saver()
+            variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+
+            if paragraps_emb is not None:
+                variables = [variable for variable in variables if variable.name not in {"paragraphs_embeddings_vectors:0","paragraphs_embeddings_vectors/Adam:0","paragraphs_embeddings_vectors/Adam_1:0", "beta1_power:0", "beta2_power:0"} and "Adam" not in variable.name]
+
+            self.session.run(tf.global_variables_initializer())
+
+            self.saver = tf.train.Saver(variables)
             self.saver.restore(self.session, os.path.join(self.feature_name, params.best_test_logdir))
+            self.saver = tf.train.Saver()
     def append_paragraph_embedding(self):
         with self.graph.as_default():
-            # with self.session as sess:
-            # print("Assign new paragraph vector")
+
             embedding = self.session.run(self.model.paragraph_embeddings_weights)
-            glorot_limit = math.sqrt(6)/(math.sqrt(2*params.word_embedding_size))
-            new_paragraph_vector = np.random.uniform(-glorot_limit, glorot_limit, size=(1, params.word_embedding_size))
+
+            new_paragraph_vector = np.random.standard_normal( size=(1, params.word_embedding_size))
             new_embedding = np.concatenate([embedding, new_paragraph_vector], axis=0)
         self.session.close()
         tf.reset_default_graph()
 
-        # self.load_graph(paragraps_emb=new_embedding)
-        self.load_graph(num_paragraphs=len(self.paragraphs_ids)-1)
-        with self.graph.as_default():
-            self.session.run(tf.assign(self.model.paragraph_embeddings_weights,new_embedding,validate_shape=False))
+        self.load_graph(num_paragraphs=len(self.paragraphs_ids)-1, paragraps_emb=new_embedding)
+        
     def train_new_paragraph(self, paragraph, paragraph_orig):
         data_master = TrainData(paragraph_index=self.paragraphs_ids )
         data_master.process_data([paragraph_orig])
@@ -245,28 +251,40 @@ class Embedding:
 
             # with self.session as sess:
 
-
+            number_batches = len(data_master.data)//params.batch_size
+            if number_batches == 0:
+                number_batches += 1
             iteration_number = params.min_iteration_number
             print('-'*10,"Start learning new paragraph", '-'*10)
             while math.fabs(loss - prev_loss) > params.eps_learn_stop or iteration_number > 0:
+                summed_loss = 0
+                summed_accuracy = 0
+                prev_loss = loss
+                for batch_number in range(number_batches):
+                    paragraphs_ids, words_ids, labels_ids = data_master.get_next_batch(params.batch_size)
+                    accuracy_b, loss_b, _ = self.session.run([self.model.accuracy, self.model.loss, self.model.opt],
+                                                         feed_dict={self.model.paragraph_id: paragraphs_ids,
+                                                                    self.model.words: words_ids,
+                                                                    self.model.target_words: labels_ids})
+                    summed_loss += loss_b
+                    summed_accuracy += accuracy_b
+                loss = summed_loss/number_batches
+                accuracy = summed_accuracy/number_batches
                 if iteration_number < params.min_iteration_number - params.max_iterations_number:
                     break
-                prev_loss = loss
-                paragraphs_ids, words_ids, labels_ids = data_master.get_next_batch(params.batch_size)
-                accuracy, loss, _ = self.session.run([self.model.accuracy, self.model.loss, self.model.opt],
-                                               feed_dict={self.model.paragraph_id: paragraphs_ids,
-                                                          self.model.words: words_ids, self.model.target_words: labels_ids})
-                iteration_number -= 1
-                print("Learning paragraph loss: %f | Previous loss: %f | Accuracy: %f "%(loss,prev_loss,accuracy))
 
-            if accuracy < 0.2:
-                print(paragraph)
+
+                iteration_number -= 1
+                # print("Learning paragraph loss: %f | Previous loss: %f | Accuracy: %f "%(loss,prev_loss,accuracy))
+
+            # if accuracy < 0.2:
+            #     print(paragraph)
             # print("Trained new paragraph")
             self.saver.save(self.session, os.path.join(self.feature_name, params.best_test_logdir))
             data_master.save_dicts(self.feature_name)
 
-            print('-' * 10, "----------------------------", '-' * 10)
-            print()
+            # print('-' * 10, "----------------------------", '-' * 10)
+            # print()
     def get_embedding(self, paragraph):
         paragraph_id = self.paragraphs_ids[paragraph]
         with self.graph.as_default():
